@@ -1,0 +1,7 @@
+node_modules/
+build/
+app/build/
+.gradle/
+local.properties
+.idea/
+app/src/main/assets/www/vendor/

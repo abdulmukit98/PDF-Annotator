@@ -1,0 +1,14 @@
+{
+  "name": "pdf-annotator-android",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Android app wrapper for PDF Annotator",
+  "scripts": {
+    "vendor": "node scripts/prepare-vendor.js",
+    "postinstall": "node scripts/prepare-vendor.js"
+  },
+  "devDependencies": {
+    "pdf-lib": "1.17.1",
+    "pdfjs-dist": "3.11.174"
+  }
+}

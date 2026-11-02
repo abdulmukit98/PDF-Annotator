@@ -1,0 +1,32 @@
+# Builds the APK in the cloud (free GitHub account). Run it from the "Actions" tab,
+# then download "pdf-annotator-apk" from the finished run.
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Download pdf.js and pdf-lib into the app
+        run: npm install
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.5
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf-annotator-apk
+          path: app/build/outputs/apk/debug/app-debug.apk

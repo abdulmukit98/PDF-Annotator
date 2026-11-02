@@ -1,0 +1,31 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.example.pdfannotator'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.pdfannotator"
+        minSdk 26          // Android 8.0; the Realme C25Y runs Android 11 (API 30)
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.9.0'   // WebViewAssetLoader
+}

@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self'">
+<title>PDF Annotator</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📝</text></svg>">
+<script src="vendor/pdf.min.js"></script>
+<script src="vendor/pdf-lib.min.js"></script>
+<!--
+=============================================================================
+PDF ANNOTATOR: documentation
+=============================================================================
+PURPOSE
+  Open a local PDF, scroll smoothly, annotate (pen, line, rectangle, typed text notes), change
+  colour and stroke width, erase, undo/redo, and keep bookmarks.
+
+ARCHITECTURE (all in this file, split into numbered sections in <script>)
+  1. Config & state     : constants and the single `state` object.
+  2. Geometry helpers   : hit-testing for the eraser.
+  3. Drawing            : draws annotations onto a page's overlay canvas.
+  4. Page rendering     : lazy PDF.js rendering, one placeholder per page.
+  5. Pointer input      : pen / line / rectangle / eraser gestures.
+  6. History            : undo / redo stack.
+  7. Bookmarks & store  : bookmark list + localStorage persistence.
+  8. UI wiring          : toolbar, zoom, shortcuts, file opening.
+  9. PDF annotations    : writes real PDF annotations, reads them back, saves.
+
+KEY DESIGN DECISIONS
+  - Coordinates: annotations are stored in PDF units (CSS px at 100% zoom),
+    never screen pixels, so they stay aligned at any zoom level.
+  - Two canvases per page: the PDF bitmap and a transparent overlay for
+    annotations. Drawing never forces the PDF page to re-render.
+  - Performance: only pages near the viewport are rendered
+    (IntersectionObserver); others are released. Pixel ratio is capped at 2.
+    On zoom the old bitmap is stretched by CSS, then re-rendered after a
+    short pause into an off-screen canvas, so there is no blank flash.
+  - Stroke width is stored per annotation, so changing the slider affects
+    only new strokes; existing ones keep their width.
+  - Text notes: click with the Text tool, type, then click away (or press
+    Ctrl+Enter) to place it; Esc cancels. Enter adds a new line. Font size =
+    12 + 1.5 x the width slider, stored per note. Text is measured with a
+    canvas context so the editor and the saved note line up.
+  - Editing notes: with the Select tool (V) click a note to select it, drag
+    it to move, drag the corner square to resize (this scales the font size),
+    and click an already-selected note to edit its text. Clearing the text
+    deletes the note. With the Text tool, clicking an existing note also edits
+    it. Moves, resizes and edits are undoable ('modify' history entries hold
+    before/after snapshots of the changed fields).
+  - Highlights: 'Highlight' (M) snaps to the PDF's own text. Each page's text
+    items are read with pdf.js `getTextContent()` (lazily, after the page
+    renders). A drag selects every item between the start and end points in
+    reading order, trimmed to the character at each end, and stores one
+    rectangle per text line (type 'hl'; pieces on the same line are merged, so spaces are covered). 'Area' (A) stores a free rectangle (type
+    'area') and also works on scanned PDFs that have no text. The 'Highlight height' slider (shown with the Highlight tool) adds 0 to 8 mm
+    above and below each line (default 2.5 mm) for new highlights; rectangles
+    are stored already padded. Both are drawn on their own layer under the ink with a CSS Multiply
+    blend (and a PDF Multiply blend when saved), so black text stays fully
+    black, as in Edge. 'More colours' opens a 60-colour palette that applies
+    to every tool; with the Select tool a chosen colour also recolours the
+    selected note. Choosing a highlight tool switches to a highlighter
+    colour and restores the pen colour afterwards.
+  - Draft storage: while you work, annotations and bookmarks are also kept in
+    localStorage (keyed by file name + size) and restored when the same,
+    unchanged file is reopened. Bookmarks live only in this draft.
+  - Saving: 'Save' (Ctrl+S) writes every annotation into the PDF as a REAL PDF
+    annotation (Ink, Line, Square, Highlight, FreeText) with its own
+    appearance stream, so Edge, Acrobat etc. show them and can edit them.
+    Each also carries a private key (PdfAnnotatorData) holding this app's
+    model as base64 JSON. 'Save copy' always gives a separate download.
+  - Erasing after saving: on open, `extractOwnAnnotations` finds annotations
+    that carry that key, imports them into the model and removes them from the
+    bytes given to pdf.js (state.bytes = the file without our annotations).
+    They are then drawn by the overlay, so they can be erased, moved or
+    recoloured like new ones; the next save writes the current model, so
+    erased marks disappear from the file. Annotations from other tools are
+    left untouched. If another program edits our annotations, this app
+    restores its own saved version.
+  - Saving in place: the desktop app writes to the opened file's path (temp
+    file + rename, via IPC); Chromium browsers write through the file handle
+    chosen with Open PDF (File System Access API). Where neither is possible
+    (for example the hosted preview) Save downloads a copy with the original
+    name. Text notes use Helvetica (Latin-1 only; other characters become '?').
+
+EXTENDING
+  - New tool: add a button with data-tool="name", handle it in
+    `attachDrawing` (create the object) and `drawAnnotation` (render it),
+    plus `segmentsOf` if the eraser should hit it.
+  - New annotation type: also handle it in `addAnnotation` (PDF subtype and
+    appearance stream) so it is saved as a real, erasable PDF annotation.
+
+KEYBOARD  H scroll, V select, P pen, L line, R rectangle, T text, M highlight
+          text, A highlight area, E eraser,
+          Ctrl+Z undo,
+          Ctrl+Shift+Z or Ctrl+Y redo.
+TOUCH     One finger draws with the active tool (use Scroll to pan with one finger).
+          Two fingers pinch-zoom and pan in any tool.
+HOSTS     Wrappers (desktop, Android) set window.PdfAnnotator.host = { openDialog,
+          saveCopy } and open files with a target { kind: 'host', write(bytes) }.
+=============================================================================
+-->
+<style>
+:root{--bg:#ecece8;--panel:#fff;--text:#1d1d1b;--muted:#6b6b66;--line:#d6d6d0;--accent:#2f6fed;--on-accent:#fff;--hover:#f0f0ec;color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#1a1a19;--panel:#262624;--text:#ececE8;--muted:#9a9a93;--line:#3a3a37;--accent:#6b9bff;--on-accent:#0d1b3a;--hover:#31312e;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#1a1a19;--panel:#262624;--text:#ececE8;--muted:#9a9a93;--line:#3a3a37;--accent:#6b9bff;--on-accent:#0d1b3a;--hover:#31312e;color-scheme:dark}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.app{display:flex;flex-direction:column;height:100%}
+.bar{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+.group{display:flex;align-items:center;gap:6px}
+.group[hidden]{display:none}
+button,.btn{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer}
+button:hover:not(:disabled),.btn:hover{background:var(--hover)}
+button:disabled{opacity:.4;cursor:default}
+button[aria-pressed="true"],.btn.primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
+input[type=color]{width:34px;height:30px;padding:0;border:1px solid var(--line);border-radius:6px;background:none}
+input[type=number]{width:56px;font:inherit;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:4px}
+input[type=range]{width:120px;accent-color:var(--accent)}
+.sw{width:20px;height:20px;border-radius:50%;padding:0;border:2px solid var(--panel);box-shadow:0 0 0 1px var(--line)}
+#preview{display:inline-block;width:56px;border-radius:99px;background:#e53935}
+output{min-width:2ch;text-align:right}
+#palette{position:fixed;z-index:20;display:grid;grid-template-columns:repeat(10,26px);gap:6px;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.25)}
+#palette[hidden]{display:none}
+#palette .sw{width:26px;height:26px;border-radius:6px}
+.muted{color:var(--muted)}
+.main{flex:1;display:flex;min-height:0;position:relative}
+#side{width:220px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:10px;overflow:auto;display:none}
+#side.open{display:block}
+#side input[type=text]{width:100%;box-sizing:border-box;font:inherit;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:5px;margin-bottom:6px}
+#bmList{list-style:none;margin:10px 0 0;padding:0}
+#bmList li{display:flex;gap:4px;margin-bottom:4px}
+#bmList .go{flex:1;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#viewer{flex:1;overflow:auto;position:relative;padding:16px 0;scroll-behavior:auto}
+#pages{display:flex;flex-direction:column;gap:14px}
+.page{position:relative;isolation:isolate;margin:0 auto;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.25);flex:none}
+.page canvas{position:absolute;top:0;left:0;width:100%;height:100%}
+.ov{touch-action:none}
+.hl{mix-blend-mode:multiply;pointer-events:none}   /* highlights tint the page but never lighten black text */
+#pages[data-tool="hand"] .ov{pointer-events:none}
+#pages:not([data-tool="hand"]) .ov{cursor:crosshair}
+#pages[data-tool="eraser"] .ov{cursor:cell}
+#pages[data-tool="text"] .ov,#pages[data-tool="highlight"] .ov{cursor:text}
+#pages[data-tool="select"] .ov{cursor:default}
+.note{position:absolute;z-index:2;margin:0;padding:0;border:0;outline:1px dashed var(--accent);background:transparent;resize:none;overflow:hidden;white-space:pre;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.25}
+#empty{text-align:center;margin-top:20vh}
+@media (max-width:700px){#side{position:absolute;z-index:5;height:100%;box-shadow:2px 0 8px rgba(0,0,0,.3)}}
+#viewer{touch-action:pan-x pan-y}   /* pinch-zoom is handled by the app, not the browser */
+@media (max-width:700px){            /* phones: one scrolling toolbar row, bigger touch targets */
+  .bar{flex-wrap:nowrap;overflow-x:auto;gap:8px;padding:6px 8px}
+  .bar>*,.group{flex:none}
+  button,.btn{padding:9px 12px}
+  .bar .sw{width:26px;height:26px}
+  input[type=range]{width:110px}
+  #status{position:fixed;left:8px;right:8px;bottom:calc(10px + env(safe-area-inset-bottom,0px));z-index:30;padding:8px 12px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.3)}
+  #status:empty{display:none}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="bar" role="toolbar" aria-label="PDF tools">
+    <button id="openBtn" class="btn primary">Open PDF</button>
+    <input id="file" type="file" accept="application/pdf" hidden>
+
+    <div class="group" id="tools" role="group" aria-label="Tool">
+      <button data-tool="hand" title="Scroll (H)">Scroll</button>
+      <button data-tool="select" title="Select, move, resize and edit text notes (V)">Select</button>
+      <button data-tool="pen" title="Pen (P)">Pen</button>
+      <button data-tool="line" title="Line (L)">Line</button>
+      <button data-tool="rect" title="Rectangle (R)">Rectangle</button>
+      <button data-tool="text" title="Text note (T)">Text</button>
+      <button data-tool="highlight" title="Highlight text (M)">Highlight</button>
+      <button data-tool="area" title="Highlight an area (A)">Area</button>
+      <button data-tool="eraser" title="Eraser (E)">Eraser</button>
+    </div>
+
+    <div class="group">
+      <input type="color" id="color" value="#e53935" aria-label="Stroke colour">
+      <span class="group" id="swatches"></span>
+      <button id="palBtn" aria-haspopup="true" aria-expanded="false" title="Open the full colour palette">More colours</button>
+    </div>
+
+    <div class="group">
+      <label for="width" class="muted">Width</label>
+      <input type="range" id="width" min="1" max="40" value="4" title="Stroke thickness (also sets font size for the Text tool)">
+      <output id="widthOut" for="width">4</output>
+      <span id="preview" aria-hidden="true"></span>
+    </div>
+
+    <div class="group" id="hlGroup" hidden>
+      <label for="hlPad" class="muted">Highlight height</label>
+      <input type="range" id="hlPad" min="0" max="8" step="0.5" value="2.5" title="Extra height added above and below each highlighted line, in millimetres">
+      <output id="hlPadOut" for="hlPad">+2.5 mm</output>
+    </div>
+
+    <div class="group">
+      <button id="undo" title="Undo (Ctrl+Z)" disabled>Undo</button>
+      <button id="redo" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
+    </div>
+
+    <div class="group">
+      <button id="zoomOut" aria-label="Zoom out">−</button>
+      <span id="zoomLbl" class="muted">100%</span>
+      <button id="zoomIn" aria-label="Zoom in">+</button>
+      <button id="fit">Fit width</button>
+    </div>
+
+    <div class="group">
+      <input type="number" id="pageNo" min="1" value="1" aria-label="Page number">
+      <span id="pageCount" class="muted">/ 0</span>
+    </div>
+
+    <button id="bmToggle">Bookmarks</button>
+    <button id="save" class="btn primary" title="Save your changes into the PDF file (Ctrl+S)">Save</button>
+    <button id="saveCopy" title="Save a separate copy of the PDF with your annotations">Save copy</button>
+    <span id="status" class="muted" role="status" aria-live="polite"></span>
+  </header>
+
+  <div class="main">
+    <aside id="side" aria-label="Bookmarks">
+      <input type="text" id="bmName" placeholder="Bookmark name (optional)" maxlength="60">
+      <button id="bmAdd" style="width:100%">Bookmark this page</button>
+      <ul id="bmList"></ul>
+    </aside>
+    <main id="viewer">
+      <div id="pages" data-tool="pen"></div>
+      <p id="empty" class="muted">Open a PDF to start. Your file stays on your device.</p>
+    </main>
+  </div>
+</div>
+
+<div id="palette" role="dialog" aria-label="Colour palette" hidden></div>
+
+<script src="app.js"></script>
+<script src="android.js"></script>
+</body>
+</html>
